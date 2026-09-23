@@ -577,10 +577,12 @@ void smp_proc_pair_cmd(tSMP_CB* p_cb, tSMP_INT_DATA* p_data) {
   STREAM_TO_UINT8(p_cb->peer_i_key, p);
   STREAM_TO_UINT8(p_cb->peer_r_key, p);
 
-  tSMP_STATUS reason = p_cb->cert_failure;
-  if (reason == SMP_ENC_KEY_SIZE) {
+  int min_key_size = btm_sec_get_min_enc_key_size();
+  if (p_cb->cert_failure == SMP_ENC_KEY_SIZE || p_cb->peer_enc_size < min_key_size) {
+    log::warn("Encryption key size {} smaller than the minimum {}", p_cb->peer_enc_size,
+              min_key_size);
     tSMP_INT_DATA smp_int_data;
-    smp_int_data.status = reason;
+    smp_int_data.status = SMP_ENC_KEY_SIZE;
     smp_sm_event(p_cb, SMP_AUTH_CMPL_EVT, &smp_int_data);
     return;
   }
@@ -834,24 +836,47 @@ void smp_br_process_pairing_command(tSMP_CB* p_cb, tSMP_INT_DATA* p_data) {
   tBTM_SEC_DEV_REC* p_dev_rec = btm_find_dev(p_cb->pairing_bda);
 
   log::verbose("addr:{}", ADDRESS_TO_LOGGABLE_CSTR(p_cb->pairing_bda));
-  /* rejecting BR pairing request over non-SC BR link */
-  if (!p_dev_rec->sec_rec.new_encryption_key_is_p256 &&
-      p_cb->role == HCI_ROLE_PERIPHERAL) {
-    tSMP_INT_DATA smp_int_data;
+
+  if (smp_command_has_invalid_length(p_cb)) {
+    tSMP_INT_DATA smp_int_data{};
+    smp_int_data.status = SMP_INVALID_PARAMETERS;
+    smp_br_state_machine_event(p_cb, SMP_BR_AUTH_CMPL_EVT, &smp_int_data);
+    return;
+  }
+
+  if (p_dev_rec == nullptr) {
+    log::error("Device not found for {}",
+            ADDRESS_TO_LOGGABLE_CSTR(p_cb->pairing_bda));
+    return;
+  }
+
+  if (!p_dev_rec->is_bonded(BT_TRANSPORT_BR_EDR) ||
+      (p_dev_rec->sec_rec.link_key_type != BTM_LKEY_TYPE_UNAUTH_COMB_P_256 &&
+       p_dev_rec->sec_rec.link_key_type != BTM_LKEY_TYPE_AUTH_COMB_P_256)) {
+    log::warn("Not bonded over BR/EDR transport with SC {}",
+            ADDRESS_TO_LOGGABLE_CSTR(p_dev_rec->bd_addr));
+    tSMP_INT_DATA smp_int_data{};
     smp_int_data.status = SMP_XTRANS_DERIVE_NOT_ALLOW;
     smp_br_state_machine_event(p_cb, SMP_BR_AUTH_CMPL_EVT, &smp_int_data);
     return;
   }
 
-  /* erase all keys if it is peripheral proc pairing req*/
-  if (p_dev_rec && (p_cb->role == HCI_ROLE_PERIPHERAL))
-    btm_sec_clear_ble_keys(p_dev_rec);
+  if (!p_dev_rec->sec_rec.is_device_encrypted()) {
+    log::warn("CKTD not allowed over unencrypted link {}",
+            ADDRESS_TO_LOGGABLE_CSTR(p_dev_rec->bd_addr));
+    tSMP_INT_DATA smp_int_data{};
+    smp_int_data.status = SMP_XTRANS_DERIVE_NOT_ALLOW;
+    smp_br_state_machine_event(p_cb, SMP_BR_AUTH_CMPL_EVT, &smp_int_data);
+    return;
+  }
 
-  p_cb->flags |= SMP_PAIR_FLAG_ENC_AFTER_PAIR;
-
-  if (smp_command_has_invalid_length(p_cb)) {
-    tSMP_INT_DATA smp_int_data;
-    smp_int_data.status = SMP_INVALID_PARAMETERS;
+  if (p_dev_rec->is_bonded(BT_TRANSPORT_LE) &&
+      ((p_dev_rec->sec_rec.sec_flags & BTM_SEC_LE_LINK_KEY_AUTHED) &&
+       !(p_dev_rec->sec_rec.sec_flags & BTM_SEC_LINK_KEY_AUTHED))) {
+    log::warn("Already bonded over LE with higher security {}",
+            ADDRESS_TO_LOGGABLE_CSTR(p_dev_rec->bd_addr));
+    tSMP_INT_DATA smp_int_data{};
+    smp_int_data.status = SMP_XTRANS_DERIVE_NOT_ALLOW;
     smp_br_state_machine_event(p_cb, SMP_BR_AUTH_CMPL_EVT, &smp_int_data);
     return;
   }
@@ -863,21 +888,33 @@ void smp_br_process_pairing_command(tSMP_CB* p_cb, tSMP_INT_DATA* p_data) {
   STREAM_TO_UINT8(p_cb->peer_i_key, p);
   STREAM_TO_UINT8(p_cb->peer_r_key, p);
 
+  int min_key_size = btm_sec_get_min_enc_key_size();
+  if (p_cb->peer_enc_size < min_key_size) {
+    log::warn("Encryption key size {} smaller than the minimum {}", p_cb->peer_enc_size,
+              min_key_size);
+    tSMP_INT_DATA smp_int_data{};
+    smp_int_data.status = SMP_ENC_KEY_SIZE;
+    smp_br_state_machine_event(p_cb, SMP_BR_AUTH_CMPL_EVT, &smp_int_data);
+    return;
+  }
+
   if (smp_command_has_invalid_parameters(p_cb)) {
-    tSMP_INT_DATA smp_int_data;
+    tSMP_INT_DATA smp_int_data{};
     smp_int_data.status = SMP_INVALID_PARAMETERS;
     smp_br_state_machine_event(p_cb, SMP_BR_AUTH_CMPL_EVT, &smp_int_data);
     return;
   }
 
-  /* peer (central) started pairing sending Pairing Request */
-  /* or being central device always use received i/r key as keys to distribute
-   */
-  p_cb->local_i_key = p_cb->peer_i_key;
-  p_cb->local_r_key = p_cb->peer_r_key;
+  log::debug(
+          "pairing_bda:{} peer_io_caps: {} peer_oob_flag: {} "
+          "peer_auth_req: {} peer_enc_size: {} peer_i_key: {} "
+          "peer_r_key: {}",
+          ADDRESS_TO_LOGGABLE_CSTR(p_cb->pairing_bda), p_cb->peer_io_caps,
+          p_cb->peer_oob_flag, p_cb->peer_auth_req,
+          p_cb->peer_enc_size, p_cb->peer_i_key, p_cb->peer_r_key);
 
   if (p_cb->role == HCI_ROLE_PERIPHERAL) {
-    p_dev_rec->sec_rec.new_encryption_key_is_p256 = false;
+    btm_sec_clear_ble_keys(p_dev_rec);   /* Erase all prior LE keys */
     /* shortcut to skip Security Grant step */
     p_cb->cb_evt = SMP_BR_KEYS_REQ_EVT;
   } else {
@@ -887,10 +924,14 @@ void smp_br_process_pairing_command(tSMP_CB* p_cb, tSMP_INT_DATA* p_data) {
         "distribution phase.");
   }
 
-  /* auth_req received via BR/EDR SM channel is set to 0,
-     but everything derived/exchanged has to be saved */
-  p_cb->peer_auth_req |= SMP_AUTH_BOND;
-  p_cb->loc_auth_req |= SMP_AUTH_BOND;
+  p_cb->flags |= SMP_PAIR_FLAG_ENC_AFTER_PAIR;
+  p_cb->local_i_key = p_cb->peer_i_key;  /* Distribute same keys as requested by peer */
+  p_cb->local_r_key = p_cb->peer_r_key;  /* Distribute same keys as requested by peer */
+  p_cb->peer_auth_req |= SMP_AUTH_BOND;  /* CTKD keys have to be persisted */
+  p_cb->loc_auth_req |= SMP_AUTH_BOND;   /* CTKD keys have to be persisted */
+
+  /* Block CTKD on reconnect */
+  p_dev_rec->sec_rec.new_encryption_key_is_p256 = false;
 }
 
 /*******************************************************************************
@@ -1096,6 +1137,8 @@ void smp_proc_srk_info(tSMP_CB* p_cb, tSMP_INT_DATA* p_data) {
 
   smp_update_key_mask(p_cb, SMP_SEC_KEY_TYPE_CSRK, true);
 
+  smp_key_distribution_by_transport(p_cb, NULL);
+
   /* save CSRK to security record */
   tBTM_LE_KEY_VALUE le_key = {
       .pcsrk_key =
@@ -1114,7 +1157,6 @@ void smp_proc_srk_info(tSMP_CB* p_cb, tSMP_INT_DATA* p_data) {
   if ((p_cb->peer_auth_req & SMP_AUTH_BOND) &&
       (p_cb->loc_auth_req & SMP_AUTH_BOND))
     btm_sec_save_le_key(p_cb->pairing_bda, BTM_LE_KEY_PCSRK, &le_key, true);
-  smp_key_distribution_by_transport(p_cb, NULL);
 }
 
 /*******************************************************************************
@@ -1973,6 +2015,16 @@ void smp_process_secure_connection_oob_data(tSMP_CB* p_cb,
   } else {
     log::verbose("local OOB randomizer is absent");
     p_cb->local_random = {0};
+  }
+
+  if (p_cb->peer_oob_flag == SMP_OOB_PRESENT && !p_sc_oob_data->loc_oob_data.present) {
+    log::warn(
+        "local OOB data is not present but peer claims to have received it; dropping "
+        "connection", __func__);
+    tSMP_INT_DATA smp_int_data{};
+    smp_int_data.status = SMP_OOB_FAIL;
+    smp_sm_event(p_cb, SMP_AUTH_CMPL_EVT, &smp_int_data);
+    return;
   }
 
   if (!p_sc_oob_data->peer_oob_data.present) {
